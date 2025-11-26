@@ -1,0 +1,524 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SISTEMA PM10 VOLUMÉTRICO (SPENCE)</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/cesium/1.95.0/Cesium.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.3.2/papaparse.min.js"></script>
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/cesium/1.95.0/Widgets/widgets.css" rel="stylesheet">
+  <style>
+    html, body, #cesiumContainer { width: 100%; height: 100%; margin: 0; padding: 0; overflow: hidden; background: #000; }
+    #controlPanel {
+      position: absolute; top: 10px; left: 10px;
+      background: rgba(0,20,40,0.95); border: 1px solid #00ffff;
+      padding: 20px; border-radius: 10px; color: #00ffff;
+      font-family: 'Courier New', monospace; z-index: 1000;
+      min-width: 350px; box-shadow: 0 0 20px rgba(0,255,255,0.3);
+    }
+    .control-group { margin: 15px 0; border-bottom: 1px solid rgba(0,255,255,0.2); padding-bottom: 10px; }
+    label { display: block; margin-bottom: 8px; font-weight: bold; color: #00ccff; }
+    input, button, select {
+      width: 100%; padding: 10px; margin: 5px 0; border: 1px solid #00ffff;
+      border-radius: 5px; background: rgba(0,50,100,0.8); color: #00ffff;
+      font-family: 'Courier New', monospace;
+    }
+    button {
+      background: linear-gradient(45deg,#ff4444,#ff8800); color: white;
+      cursor: pointer; font-weight: bold; text-transform: uppercase;
+      transition: all 0.3s; box-shadow: 0 0 10px rgba(255,68,68,0.3);
+    }
+    button:hover { background: linear-gradient(45deg,#ff6666,#ffaa00); transform: translateY(-2px); }
+    .legend { margin-top: 15px; padding: 15px; background: rgba(0,0,0,0.8); border: 1px solid #00ffff; border-radius: 8px; }
+    .legend-item { display: flex; align-items: center; margin: 8px 0; font-size: 12px; }
+    .color-box { width: 25px; height: 15px; margin-right: 15px; border: 1px solid #00ffff; }
+    .status-info { background: rgba(0,50,0,0.8); border: 1px solid #00ff00; padding: 10px; border-radius: 5px; margin-top: 10px; font-size: 11px; color: #00ff88; }
+  </style>
+</head>
+<body>
+  <div id="cesiumContainer"></div>
+  <div id="controlPanel">
+    <h3>⚡ SISTEMA PM10 VOLUMÉTRICO (SPENCE) ⚡</h3>
+    <div class="control-group">
+      <label>CSV PM10</label>
+      <input type="file" id="fileUpload" accept=".csv">
+      <small>Cabeceras flex: lat/latitude, lon/long/longitude, pm10/PM10, (opcional) date/datetime/timestamp</small>
+    </div>
+    <div class="control-group">
+      <label>📅 Fecha:</label>
+      <input type="date" id="dateInput" value="2025-09-22">
+    </div>
+    <div class="control-group">
+      <label>⏰ Hora: <span id="hourValue">14</span>:00</label>
+      <input type="range" id="hourSlider" min="0" max="23" value="14">
+    </div>
+    <div class="control-group">
+      <label>🎚️ Intensidad:</label>
+      <input type="range" id="intensitySlider" min="0.1" max="3" value="1" step="0.1">
+    </div>
+    <button id="loadWeatherBtn">🌪️ Cargar viento simulado</button>
+    <button id="animateBtn">▶️ Iniciar animación</button>
+    <button id="resetBtn">🔄 Reset vista</button>
+    <button id="toggleModeBtn">🔀 Modo volumétrico</button>
+    <div class="legend">
+      <h4>Escala PM10 (µg/m³)</h4>
+      <div class="legend-item"><div class="color-box" style="background:#ffff00;"></div><span>0–25 Excelente</span></div>
+      <div class="legend-item"><div class="color-box" style="background:#ffaa00;"></div><span>26–75 Moderado</span></div>
+      <div class="legend-item"><div class="color-box" style="background:#ff6600;"></div><span>76–150 Dañino</span></div>
+      <div class="legend-item"><div class="color-box" style="background:#ff0000;"></div><span>>150 Peligroso</span></div>
+    </div>
+    <div class="status-info" id="statusInfo">
+      <div>📊 Puntos PM10: <span id="pm10Count">0</span></div>
+      <div>💨 Partículas viento: <span id="windCount">0</span></div>
+      <div>⚡ Estado: <span id="systemStatus">Iniciando...</span></div>
+    </div>
+  </div>
+
+  <script>
+    // ==================== MAPBOX TOKEN ====================
+    const MAPBOX_TOKEN = "pk.eyJ1IjoidGFtYXJhc2dlbyIsImEiOiJjbWUxaDN6cmgwZXZrMmpvdzZvYXRleHE2In0.nDUziRN7DXA83Pu1Xwqwag";
+
+    // ==================== SPENCE BBOX ====================
+    const SPENCE_RECT = Cesium.Rectangle.fromDegrees(-69.30, -22.82, -69.25, -22.77);
+
+    // ==================== IMAGERY PROVIDERS ====================
+    function makeMapbox(token){
+      return new Cesium.UrlTemplateImageryProvider({
+        url: "https://api.mapbox.com/styles/v1/mapbox/satellite-v9/tiles/256/{z}/{x}/{y}?access_token=" + token,
+        tilingScheme: new Cesium.WebMercatorTilingScheme(),
+        maximumLevel: 18
+      });
+    }
+    function makeArcGis(){
+      return new Cesium.ArcGisMapServerImageryProvider({
+        url: "https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer"
+      });
+    }
+    function makeOSM(){
+      return new Cesium.OpenStreetMapImageryProvider({ url: "https://a.tile.openstreetmap.org/" });
+    }
+
+    // ==================== VIEWER ====================
+    Cesium.Ion.defaultAccessToken = undefined; // sin Ion (evita pantalla azul por 4xx)
+    const viewer = new Cesium.Viewer("cesiumContainer", {
+      imageryProvider: makeArcGis(), // de inicio
+      terrainProvider: new Cesium.EllipsoidTerrainProvider(), // sin Ion terrain
+      baseLayerPicker: false,
+      animation: true,
+      timeline: true,
+      geocoder: false,
+      sceneModePicker: true
+    });
+
+    // Intentar Mapbox y caer a ArcGIS/OSM según errores
+    (function setImageryChain(){
+      let provider = null;
+      if (MAPBOX_TOKEN && MAPBOX_TOKEN.startsWith("pk.")) {
+        provider = makeMapbox(MAPBOX_TOKEN);
+      } else {
+        provider = makeArcGis();
+      }
+      viewer.imageryLayers.removeAll();
+      const layer = viewer.imageryLayers.addImageryProvider(provider);
+      provider.errorEvent.addEventListener(function(){
+        console.warn("Mapbox/ArcGIS falló, cambiando a OSM");
+        viewer.imageryLayers.removeAll();
+        viewer.imageryLayers.addImageryProvider(makeOSM());
+      });
+    })();
+
+    // Vista inicial en Spence
+    viewer.camera.setView({
+      destination: SPENCE_RECT,
+      orientation: { heading: 0.0, pitch: -0.6, roll: 0.0 }
+    });
+
+    // Ambiente
+    viewer.scene.globe.enableLighting = true;
+    viewer.scene.globe.showGroundAtmosphere = true;
+    viewer.scene.fog.enabled = true;
+    viewer.scene.fog.density = 0.00015;
+    viewer.scene.backgroundColor = Cesium.Color.BLACK;
+
+    // ==================== ESTADO / UTILS ====================
+    function updateStatus(msg){ document.getElementById("systemStatus").textContent = msg; console.log("[Estado]", msg); }
+    function clamp(v, a, b){ return Math.max(a, Math.min(b, v)); }
+    function toHourKey(dateStr, hourInt){
+      // dateStr: "YYYY-MM-DD", hourInt: 0..23
+      function pad(n){ return n<10?("0"+n):(""+n); }
+      return dateStr + " " + pad(hourInt) + ":00";
+    }
+    function parseHourFromRow(row){
+      const cands = ["date","datetime","timestamp","fecha","time","hora"];
+      for (var i=0;i<cands.length;i++){
+        const k = cands[i];
+        if (row[k] != null && row[k] !== "") {
+          const s = (""+row[k]).replace("T"," ").trim();
+          // Normalizamos a "YYYY-MM-DD HH:MM"
+          var m = s.match(/^(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})[ T](\d{1,2}):(\d{2})/);
+          if (m) return m[1]+"-"+("0"+m[2]).slice(-2)+"-"+("0"+m[3]).slice(-2)+" "+("0"+m[4]).slice(-2)+":"+("0"+m[5]).slice(-2);
+          m = s.match(/^(\d{1,2})[-/.](\d{1,2})[-/.](\d{4})[ T](\d{1,2}):(\d{2})/);
+          if (m) return m[3]+"-"+("0"+m[2]).slice(-2)+"-"+("0"+m[1]).slice(-2)+" "+("0"+m[4]).slice(-2)+":"+("0"+m[5]).slice(-2);
+        }
+      }
+      return null; // sin hora usable
+    }
+    function num(v){ if (typeof v==="number") return v; return Number((""+v).replace(",",".")); }
+
+    // Escala de color PM10
+    const pm10Scale = [
+      {v:0,   c: new Cesium.Color(1.0,1.0,0.0,0.85)},
+      {v:25,  c: new Cesium.Color(1.0,0.67,0.0,0.9)},
+      {v:75,  c: new Cesium.Color(1.0,0.4,0.0,0.95)},
+      {v:150, c: new Cesium.Color(1.0,0.0,0.0,1.0)},
+      {v:300, c: new Cesium.Color(0.8,0.0,0.0,1.0)}
+    ];
+    function colorFromPM10(val){
+      for (var i=0;i<pm10Scale.length-1;i++){
+        var a = pm10Scale[i], b = pm10Scale[i+1];
+        if (val <= b.v){
+          var r = (val-a.v)/Math.max(1e-6,(b.v-a.v));
+          return Cesium.Color.lerp(a.c, b.c, r, new Cesium.Color());
+        }
+      }
+      return pm10Scale[pm10Scale.length-1].c;
+    }
+
+    // ==================== DATOS / ESTADO APP ====================
+    let rawRows = [];         // filas crudas del CSV
+    let pmPoints = [];        // [{lat,lon,pm10,hourKey?}]
+    let pmEntities = [];      // prismas
+    let volEntities = [];     // ellipsoids / partículas internas
+    let windField = [];       // puntos de viento
+    let windEntities = [];    // partículas animadas
+    let isVolumetric = false;
+    let intensityMul = 1.0;
+    let animating = false;
+
+    // ==================== CARGA CSV ====================
+    document.getElementById("fileUpload").addEventListener("change", function(e){
+      const f = e.target.files[0];
+      if (!f) return;
+      updateStatus("Procesando CSV...");
+      Papa.parse(f, {
+        header: true, dynamicTyping: true, skipEmptyLines: true,
+        complete: function(res){
+          rawRows = res.data || [];
+          // Normalización
+          pmPoints = [];
+          for (var k=0;k<rawRows.length;k++){
+            const r = rawRows[k];
+            const lat = num(r.lat ?? r.latitude ?? r.Latitude ?? r.LAT);
+            const lon = num(r.lon ?? r.long ?? r.longitude ?? r.Lon ?? r.LONG);
+            const value = num(r.pm10 ?? r.PM10 ?? r.pm_10 ?? r.pm);
+            if (isFinite(lat) && isFinite(lon) && isFinite(value)) {
+              const hk = parseHourFromRow(r); // puede ser null
+              pmPoints.push({lat:lat, lon:lon, pm10:value, hourKey: hk});
+            }
+          }
+          document.getElementById("pm10Count").textContent = pmPoints.length;
+          updateStatus(pmPoints.length ? "CSV cargado" : "CSV cargado, sin filas válidas");
+          drawPM10(); // dibuja con la hora actual o todas si no existe hora
+        }
+      });
+    });
+
+    // ==================== INTERPOLACIÓN IDW ====================
+    function idw(lat, lon, pts, power){
+      var nume=0, deno=0, nearest=Infinity, nearVal=null;
+      for (var i=0;i<pts.length;i++){
+        const p = pts[i];
+        const dx = (lon - p.lon) * 111000 * Math.cos(lat*Math.PI/180);
+        const dy = (lat - p.lat) * 111000;
+        const d = Math.sqrt(dx*dx + dy*dy);
+        if (d < 80) return p.pm10; // muy cerca: valor directo (80 m)
+        if (d < nearest){ nearest=d; nearVal=p.pm10; }
+        const w = 1/Math.pow(d, power);
+        nume += w * p.pm10;
+        deno += w;
+      }
+      if (deno>0){
+        const v = nume/deno;
+        return Math.max(0, Math.min(v, nearVal*1.6)); // límite suave
+      }
+      return nearVal ?? 0;
+    }
+
+    function calcBounds(pts){
+      if (!pts.length) return null;
+      let minLat=pts[0].lat, maxLat=pts[0].lat, minLon=pts[0].lon, maxLon=pts[0].lon;
+      for (var i=1;i<pts.length;i++){
+        const p = pts[i];
+        if (p.lat<minLat) minLat=p.lat; if (p.lat>maxLat) maxLat=p.lat;
+        if (p.lon<minLon) minLon=p.lon; if (p.lon>maxLon) maxLon=p.lon;
+      }
+      return {south:minLat, north:maxLat, west:minLon, east:maxLon};
+    }
+
+    function makeGrid(pts){
+      const b = calcBounds(pts);
+      if (!b) return [];
+      // Paso adaptativo (grilla en grados). Limitamos total a ~4000 celdas.
+      let step = 0.0015; // ~160 m en lat
+      let nx = Math.ceil((b.east-b.west)/step)+1;
+      let ny = Math.ceil((b.north-b.south)/step)+1;
+      const maxCells = 4000;
+      while (nx*ny > maxCells){ step *= 1.25; nx = Math.ceil((b.east-b.west)/step)+1; ny = Math.ceil((b.north-b.south)/step)+1; }
+      const grid = [];
+      for (let y=0;y<ny;y++){
+        const lat = b.south + y*step;
+        for (let x=0;x<nx;x++){
+          const lon = b.west + x*step;
+          const val = idw(lat, lon, pts, 2);
+          if (val>0) grid.push({lat,lon,val});
+        }
+      }
+      return grid;
+    }
+
+    // ==================== DIBUJO PM10 ====================
+    function clearPM10(){
+      pmEntities.forEach(e => viewer.entities.remove(e));
+      volEntities.forEach(e => viewer.entities.remove(e));
+      pmEntities = []; volEntities = [];
+    }
+
+    function drawPM10(){
+      clearPM10();
+      if (!pmPoints.length) return;
+
+      const day = document.getElementById("dateInput").value;
+      const hour = parseInt(document.getElementById("hourSlider").value,10);
+      const hkWanted = toHourKey(day, hour);
+      // Si el CSV trae hora, filtramos; si no, usamos todas
+      let pts = pmPoints;
+      if (pmPoints.some(p => p.hourKey)){
+        pts = pmPoints.filter(p => p.hourKey && p.hourKey.slice(0,13)===hkWanted.slice(0,13));
+        if (!pts.length){ updateStatus("No hay datos PM10 para esa hora; mostrando todo el CSV"); pts = pmPoints; }
+      }
+
+      // Interpolación a grilla y dibujo
+      const grid = makeGrid(pts);
+      const maxVal = Math.max.apply(null, grid.map(g => g.val).concat(pts.map(p=>p.pm10)));
+
+      if (isVolumetric){
+        // Modo volumétrico (nubes/ellipsoids) + partículas internas
+        for (var i=0;i<grid.length;i++){
+          const g = grid[i];
+          const norm = g.val / Math.max(1e-6,maxVal);
+          if (g.val<10) continue; // ignora muy bajo
+          const color = colorFromPM10(g.val);
+          const radius = 200 + norm * 1400 * intensityMul;
+          const height = 300 + norm * 2500 * intensityMul;
+
+          const e = viewer.entities.add({
+            position: Cesium.Cartesian3.fromDegrees(g.lon, g.lat, height*0.5),
+            ellipsoid: {
+              radii: new Cesium.Cartesian3(radius, radius, height),
+              material: color.withAlpha(0.45 + 0.35*norm),
+              outline: false
+            },
+            description: "PM10: "+g.val.toFixed(1)+" µg/m³"
+          });
+          volEntities.push(e);
+
+          if (g.val>60){
+            // pequeñas partículas brillantes internas
+            for (var m=0;m<2;m++){
+              const pe = viewer.entities.add({
+                position: Cesium.Cartesian3.fromDegrees(
+                  g.lon + (Math.random()-0.5)*0.003,
+                  g.lat + (Math.random()-0.5)*0.003,
+                  height*0.5 + (Math.random()-0.5)*height*0.3
+                ),
+                point: {
+                  pixelSize: 3 + 4*norm,
+                  color: color.withAlpha(0.9),
+                  outlineWidth: 1,
+                  outlineColor: Cesium.Color.WHITE.withAlpha(0.6)
+                }
+              });
+              volEntities.push(pe);
+            }
+          }
+        }
+        updateStatus("PM10 dibujado (volumétrico)");
+      } else {
+        // Modo estándar (prismas/cilindros)
+        for (var j=0;j<grid.length;j++){
+          const g = grid[j];
+          const norm = g.val / Math.max(1e-6,maxVal);
+          const color = colorFromPM10(g.val);
+          const e = viewer.entities.add({
+            position: Cesium.Cartesian3.fromDegrees(g.lon, g.lat, 400),
+            cylinder: {
+              length: 200 + g.val*18 * intensityMul,
+              topRadius: 120 + norm*220,
+              bottomRadius: 100 + norm*180,
+              material: color,
+              outline: true,
+              outlineColor: Cesium.Color.WHITE.withAlpha(0.25)
+            },
+            description: "PM10: "+g.val.toFixed(1)+" µg/m³"
+          });
+          pmEntities.push(e);
+        }
+        updateStatus("PM10 dibujado (prismas)");
+      }
+
+      // Enfoca a la zona de datos (si hay)
+      const b = calcBounds(pts);
+      if (b){
+        viewer.camera.setView({
+          destination: Cesium.Rectangle.fromDegrees(
+            b.west-0.01, b.south-0.01, b.east+0.01, b.north+0.01
+          ),
+          orientation: { heading: 0.0, pitch: -0.6, roll: 0.0 }
+        });
+      }
+
+      document.getElementById("pm10Count").textContent = pts.length;
+    }
+
+    // ==================== VIENTO (SIMULADO) ====================
+    function clearWind(){
+      windEntities.forEach(e => viewer.entities.remove(e));
+      windEntities = [];
+      windField = [];
+      document.getElementById("windCount").textContent = "0";
+    }
+
+    function generateWind(bounds, nx, ny){
+      const data = [];
+      const stepLat = (bounds.north - bounds.south) / Math.max(1,nx-1);
+      const stepLon = (bounds.east  - bounds.west ) / Math.max(1,ny-1);
+      const cLat = (bounds.north + bounds.south)/2;
+      const cLon = (bounds.east  + bounds.west )/2;
+      for (var i=0;i<nx;i++){
+        for (var j=0;j<ny;j++){
+          const lat = bounds.south + i*stepLat;
+          const lon = bounds.west  + j*stepLon;
+          const dx = (lon - cLon) * 111000;
+          const dy = (lat - cLat) * 111000;
+          const dist = Math.sqrt(dx*dx + dy*dy);
+          const angle = Math.atan2(dy, dx) + Math.PI/2; // circulación
+          const maxWind = 22, r0 = 14000;
+          var speed = maxWind * Math.exp(-Math.pow(dist - r0, 2) / (2*Math.pow(r0*0.5,2)));
+          speed = Math.max(2, speed + (Math.random()-0.5)*4);
+          const dir = (angle*180/Math.PI + 360)%360;
+          data.push({lat,lon,speed,dir});
+        }
+      }
+      return data;
+    }
+
+    function drawWindParticles(){
+      clearWind();
+      // bounds: del PM10 si existe, si no usa Spence
+      const bounds = pmPoints.length ? calcBounds(pmPoints) : {south:-22.82, north:-22.77, west:-69.30, east:-69.25};
+      windField = generateWind(bounds, 14, 14);
+
+      const start = viewer.clock.currentTime.clone();
+      const duration = 60; // s
+
+      for (var i=0;i<windField.length;i++){
+        const p = windField[i];
+        const nParticles = Math.min(4, Math.max(1, Math.floor(p.speed/6)));
+        for (var k=0;k<nParticles;k++){
+          const pos = new Cesium.SampledPositionProperty();
+          const dirRad = p.dir*Math.PI/180;
+          let lat = p.lat + (Math.random()-0.5)*0.006;
+          let lon = p.lon + (Math.random()-0.5)*0.006;
+          let alt = 400 + Math.random()*1800;
+          const vms = p.speed*0.7;
+
+          for (var t=0;t<=duration;t+=1){
+            const time = Cesium.JulianDate.addSeconds(start, t, new Cesium.JulianDate());
+            const turb = 0.00006*(Math.random()-0.5);
+            lat += Math.sin(dirRad)*vms*0.000009 + turb;
+            lon += Math.cos(dirRad)*vms*0.000009 + turb;
+            alt += Math.sin(t*0.08)*14;
+            pos.addSample(time, Cesium.Cartesian3.fromDegrees(lon,lat,alt));
+          }
+
+          const color =
+            p.speed>18 ? Cesium.Color.RED :
+            p.speed>10 ? Cesium.Color.ORANGE :
+            p.speed>5  ? Cesium.Color.YELLOW : Cesium.Color.CYAN;
+
+          const ent = viewer.entities.add({
+            availability: new Cesium.TimeIntervalCollection([ new Cesium.TimeInterval({
+              start: start, stop: Cesium.JulianDate.addSeconds(start,duration,new Cesium.JulianDate())
+            }) ]),
+            position: pos,
+            point: {
+              pixelSize: Math.max(3, p.speed*0.35),
+              color: color.withAlpha(0.9),
+              outlineColor: Cesium.Color.WHITE.withAlpha(0.3),
+              outlineWidth: 1
+            },
+            path: {
+              resolution: 1,
+              material: new Cesium.PolylineGlowMaterialProperty({ glowPower: 0.3, color: color.withAlpha(0.7) }),
+              width: Math.max(2, p.speed*0.18),
+              leadTime: 0,
+              trailTime: 14
+            }
+          });
+          windEntities.push(ent);
+        }
+      }
+
+      const stop = Cesium.JulianDate.addSeconds(start, duration, new Cesium.JulianDate());
+      viewer.clock.startTime = start;
+      viewer.clock.stopTime = stop;
+      viewer.clock.currentTime = start.clone();
+      viewer.clock.clockRange = Cesium.ClockRange.LOOP_STOP;
+      viewer.clock.multiplier = 2;
+
+      document.getElementById("windCount").textContent = windEntities.length;
+      updateStatus("Partículas de viento activas");
+    }
+
+    // ==================== UI HANDLERS ====================
+    document.getElementById("hourSlider").addEventListener("input", function(e){
+      document.getElementById("hourValue").textContent = e.target.value;
+      drawPM10();
+    });
+
+    document.getElementById("intensitySlider").addEventListener("input", function(e){
+      intensityMul = parseFloat(e.target.value);
+      drawPM10();
+    });
+
+    document.getElementById("toggleModeBtn").addEventListener("click", function(){
+      isVolumetric = !isVolumetric;
+      this.textContent = isVolumetric ? "🔀 Modo estándar" : "🔀 Modo volumétrico";
+      drawPM10();
+    });
+
+    document.getElementById("resetBtn").addEventListener("click", function(){
+      viewer.camera.setView({
+        destination: SPENCE_RECT,
+        orientation: { heading: 0.0, pitch: -0.6, roll: 0.0 }
+      });
+      updateStatus("Vista restablecida");
+    });
+
+    document.getElementById("animateBtn").addEventListener("click", function(){
+      animating = !animating;
+      viewer.clock.shouldAnimate = animating;
+      this.textContent = animating ? "⏸️ Pausar animación" : "▶️ Iniciar animación";
+      updateStatus(animating ? "Animación en curso" : "Animación pausada");
+    });
+
+    document.getElementById("loadWeatherBtn").addEventListener("click", function(){
+      drawWindParticles();
+    });
+
+    // ==================== INICIO ====================
+    intensityMul = parseFloat(document.getElementById("intensitySlider").value);
+    updateStatus("Sistema listo en Spence con imagen satelital");
+  </script>
+</body>
+</html>
